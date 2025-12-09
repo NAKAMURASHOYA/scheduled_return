@@ -6,9 +6,20 @@
 // スプレッドシートに新しいデータが追加されたらGoogle Chat（【通知用】ITヘルプデスク対応依頼）へAllで通知
 
 function fetchAndWriteContractData() {
+  // スクリプトプロパティから設定値を取得
+  var props = PropertiesService.getScriptProperties();
+  var SPREADSHEET_ID = props.getProperty('SPREADSHEET_ID');
+  var API_KEY = props.getProperty('API_KEY');
+  var API_SECRET_KEY = props.getProperty('API_SECRET_KEY');
+  
+  if (!SPREADSHEET_ID || !API_KEY || !API_SECRET_KEY) {
+    Logger.log("Error: スクリプトプロパティが設定されていません。");
+    return;
+  }
+
   // スプレッドシートの特定のシートを取得
-  var spreadsheet = SpreadsheetApp.openById("1lLD0DAdixWd4dmMY9LXZzmSiNbfb9XaTTmP70cchNBc"); // スプレッドシートのIDを指定
-  var sheet = spreadsheet.getSheetByName("PC等レンタル返却管理"); // シート名を指定
+  var spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var sheet = spreadsheet.getSheetByName("PC等レンタル返却管理");
   
   // 以前に取得した契約データを保存する Set オブジェクト
   var existingContracts = new Set();
@@ -19,19 +30,15 @@ function fetchAndWriteContractData() {
     existingContracts.add(row[1]); // 個品番号（YRL管理番号）をセットに追加
   });
 
-  // APIキーとシークレットキー
-  var apiKey = '9s7y7w5v0mkock8884wkk40cg';
-  var apiSecretKey = '537xdz0p2c08wwscggg4400cw';
-
   // Step 1: API SignatureとSIDを取得
-  var { apiSignature, sid } = getAPISignatureAndSID(apiKey, apiSecretKey);
+  var { apiSignature, sid } = getAPISignatureAndSID(API_KEY, API_SECRET_KEY);
   if (!apiSignature || !sid) {
     Logger.log("Failed to get API signature and SID");
     return;
   }
 
   // レンタル契約情報の取得
-  var contractList = getContractList(apiKey, apiSignature, sid);
+  var contractList = getContractList(API_KEY, apiSignature, sid);
   if (!contractList) {
     Logger.log("Failed to fetch contract data");
     return;
@@ -47,7 +54,7 @@ function fetchAndWriteContractData() {
     if (!existingContracts.has(contract.khno)) {
       // 最終行を取得
       var lastRow = sheet.getLastRow();
-      // H列以降にデータがある場合は、G列までの最終行に書き込む
+      // H列以降にデータがある場合は、G列までの最終行に書き込む (元のロジック維持)
       if (sheet.getRange(lastRow, 8).getValue() !== "") {
         lastRow++;
       }
@@ -64,18 +71,18 @@ function fetchAndWriteContractData() {
       sheet.getRange(lastRow + 1, 6).setValue(contract.srno); // シリアル番号 (F列)
       sheet.getRange(lastRow + 1, 7).setValue(contract.statics_name_s); // 商品小分類=製品カテゴリ (G列)
       
-      existingContracts.add(contract.khno); // 重複をチェックするために、契約番号をexistingContractsに追加する
+      existingContracts.add(contract.khno); // 重複チェック用に追加
       
-      isNewDataAdded = true; // 新しいデータが追加されたことをフラグで示す
+      isNewDataAdded = true;
       newContractsCount++;
     } else {
-      Logger.log("Duplicate contract found: " + contract.khno); // 重複が見つかった場合にログに記録する
+      Logger.log("Duplicate contract found: " + contract.khno);
     }
   });
 
   // 新しいデータが追加された場合に通知を送信
   if (isNewDataAdded) {
-    sendNotification(newContractsCount); // Google Chat へ通知を送信する関数を呼び出す
+    sendNotification(newContractsCount, SPREADSHEET_ID);
   }
 
   Logger.log("Contract data fetched and written to spreadsheet successfully");
@@ -93,12 +100,18 @@ function getAPISignatureAndSID(apiKey, apiSecretKey) {
     }
   };
   var step1Response = UrlFetchApp.fetch(step1Url, step1Params);
-  var step1Data = JSON.parse(step1Response.getContentText());
-  if (step1Data.status != "1") {
-    Logger.log("Failed to get API signature and SID");
+  
+  try {
+    var step1Data = JSON.parse(step1Response.getContentText());
+    if (step1Data.status != "1") {
+      Logger.log("Failed to get API signature and SID: " + step1Data.status);
+      return { apiSignature: null, sid: null };
+    }
+    return { apiSignature: step1Data.api_signature, sid: step1Data.sid };
+  } catch (e) {
+    Logger.log("JSON Parse Error (Step 1): " + e);
     return { apiSignature: null, sid: null };
   }
-  return { apiSignature: step1Data.api_signature, sid: step1Data.sid };
 }
 
 // レンタル契約情報を取得する関数
@@ -111,23 +124,36 @@ function getContractList(apiKey, apiSignature, sid) {
       api_key: apiKey,
       api_signature: apiSignature,
       sid: sid,
-      pageID: 1, // ページ番号は1から始める
-      "search[rtod1]": Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd"), // 本日の日付
-      "search[rtod2]": Utilities.formatDate(new Date(Date.now() + 40 * 24 * 60 * 60 * 1000), Session.getScriptTimeZone(), "yyyy-MM-dd") // 40日後の日付（横河レンタ・リースの返却連絡イメージが3週間～1ヶ月の間との事だった為）
+      pageID: 1, // ページ番号
+      "search[rtod1]": Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd"), // 本日
+      "search[rtod2]": Utilities.formatDate(new Date(Date.now() + 40 * 24 * 60 * 60 * 1000), Session.getScriptTimeZone(), "yyyy-MM-dd") // 40日後
     }
   };
   var step2Response = UrlFetchApp.fetch(step2Url, step2Params);
-  var step2Data = JSON.parse(step2Response.getContentText());
-  if (step2Data.status != 1) {
-    Logger.log("Failed to fetch contract data");
+  
+  try {
+    var step2Data = JSON.parse(step2Response.getContentText());
+    if (step2Data.status != 1) {
+      Logger.log("Failed to fetch contract data. Status: " + step2Data.status);
+      return null;
+    }
+    return step2Data.contract_list;
+  } catch (e) {
+    Logger.log("JSON Parse Error (Step 2): " + e);
     return null;
   }
-  return step2Data.contract_list;
 }
 
 // Google Chat へ通知を送信する関数
-function sendNotification(newContractsCount) {
-  // 通知の内容を設定
+function sendNotification(newContractsCount, spreadsheetId) {
+  // Webhook URLもプロパティから取得
+  var webhookUrl = PropertiesService.getScriptProperties().getProperty('CHAT_WEBHOOK_URL');
+  
+  if (!webhookUrl) {
+    Logger.log("Webhook URL is not set in Script Properties");
+    return;
+  }
+
   var message = {
     text:"～レンタル返却管理～"
     + '\n' +
@@ -135,13 +161,9 @@ function sendNotification(newContractsCount) {
     + '\n' +
     "新たに返却予定の情報が " + newContractsCount + " 件追加されました！"
     + '\n\n' +
-    "https://docs.google.com/spreadsheets/d/1lLD0DAdixWd4dmMY9LXZzmSiNbfb9XaTTmP70cchNBc/edit#gid=1906719251"
+    "https://docs.google.com/spreadsheets/d/" + spreadsheetId + "/edit#gid=1906719251"
   };
 
-  // 送信先のチャットルームの Webhook URL を設定
-  var webhookUrl = "https://chat.googleapis.com/v1/spaces/AAAAKofE5zM/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=GfY9OxioFoI-wp6iU2zP9X5v33QHP0wJT6nL8FhXhCw"; // ここに自分のGoogle ChatのWebhook URLを設定する
-
-  // HTTPリクエストを送信して通知を送信
   var options = {
     method: "post",
     contentType: "application/json",
