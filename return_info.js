@@ -50,7 +50,7 @@ function return_count() {
 function return_info(rows,dData) {
 
   // 送信先のチャットルームの Webhook URL を設定
-  let webhookUrl = "https://chat.googleapis.com/v1/spaces/AAAAKofE5zM/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=GfY9OxioFoI-wp6iU2zP9X5v33QHP0wJT6nL8FhXhCw"; 
+  var webhookUrl = PropertiesService.getScriptProperties().getProperty('CHAT_WEBHOOK_URL');; 
 
   // 通知の内容を設定
   let message = {
@@ -86,6 +86,3 @@ function return_info(rows,dData) {
   UrlFetchApp.fetch(webhookUrl, options);
 
 }
-
-
-
