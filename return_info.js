@@ -1,6 +1,6 @@
 function return_count() {
 
-  const ss = SpreadsheetApp.openById('1lLD0DAdixWd4dmMY9LXZzmSiNbfb9XaTTmP70cchNBc');
+  var ss = props.getProperty('SPREADSHEET_ID');
   const st = ss.getSheetByName("PC等レンタル返却管理");
 
   let today = new Date();
