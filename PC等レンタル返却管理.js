@@ -6,15 +6,18 @@
 // スプレッドシートに新しいデータが追加されたらGoogle Chat（【通知用】ITヘルプデスク対応依頼）へAllで通知
 
 function fetchAndWriteContractData() {
+  // ▼▼ 設定項目 ▼▼
+  var SEARCH_DAYS_RANGE = 60; // 本日から何日後まで検索するか（ここを変更してください）
+  // ▲▲ 設定項目 ▲▲
+
   // --- プロパティの取得 ---
   var props = PropertiesService.getScriptProperties();
   var SPREADSHEET_ID = props.getProperty('SPREADSHEET_ID');
   var API_KEY = props.getProperty('API_KEY');
   var API_SECRET_KEY = props.getProperty('API_SECRET_KEY');
   
-  // プロパティチェック
   if (!SPREADSHEET_ID || !API_KEY || !API_SECRET_KEY) {
-    Logger.log("❌ Error: スクリプトプロパティが設定されていません。プロジェクトの設定を確認してください。");
+    Logger.log("❌ Error: スクリプトプロパティが設定されていません。");
     return;
   }
 
@@ -23,13 +26,13 @@ function fetchAndWriteContractData() {
   try {
     spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
   } catch(e) {
-    Logger.log("❌ Error: スプレッドシートが開けません。IDが正しいか確認してください。 ID: " + SPREADSHEET_ID);
+    Logger.log("❌ Error: スプレッドシートが開けません。ID確認: " + SPREADSHEET_ID);
     return;
   }
   
   var sheet = spreadsheet.getSheetByName("PC等レンタル返却管理");
   if (!sheet) {
-    Logger.log("❌ Error: シート「PC等レンタル返却管理」が見つかりません。");
+    Logger.log("❌ Error: シートが見つかりません。");
     return;
   }
 
@@ -37,10 +40,11 @@ function fetchAndWriteContractData() {
   var existingContracts = new Set();
   var lastRow = sheet.getLastRow();
   
-  if (lastRow > 1) { // データがある場合のみ
-    var data = sheet.getRange(2, 2, lastRow - 1, 1).getValues(); // B列(YRL管理番号)のみ取得して高速化
+  if (lastRow > 1) { 
+    // B列(YRL管理番号)のみ取得
+    var data = sheet.getRange(2, 2, lastRow - 1, 1).getValues(); 
     data.forEach(function(row) {
-      existingContracts.add(String(row[0])); // 文字列として保存
+      existingContracts.add(String(row[0])); 
     });
   }
 
@@ -48,86 +52,107 @@ function fetchAndWriteContractData() {
   Logger.log("Step 1: API認証を開始します...");
   var authData = getAPISignatureAndSID(API_KEY, API_SECRET_KEY);
   if (!authData.apiSignature || !authData.sid) {
-    Logger.log("❌ Stop: API認証に失敗したため終了します。");
+    Logger.log("❌ Stop: API認証失敗");
     return;
   }
-  Logger.log("Step 1 OK: SID取得成功");
+  
+  // --- Step 2: 全ページの契約データを取得 ---
+  Logger.log("Step 2: 契約データを全ページ分取得します（期間: " + SEARCH_DAYS_RANGE + "日後まで）");
+  
+  var allContracts = [];
+  var page = 1;
+  var hasNextPage = true;
 
-  // --- Step 2: レンタル契約情報の取得 ---
-  Logger.log("Step 2: 契約データを取得します...");
-  var contractList = getContractList(API_KEY, authData.apiSignature, authData.sid);
-  if (!contractList) {
-    Logger.log("❌ Stop: 契約データの取得に失敗したため終了します。");
-    return;
+  while (hasNextPage) {
+    // ページ番号を指定して取得
+    var pageList = getContractList(API_KEY, authData.apiSignature, authData.sid, page, SEARCH_DAYS_RANGE);
+    
+    if (pageList && pageList.length > 0) {
+      Logger.log("Page " + page + ": " + pageList.length + "件取得");
+      allContracts = allContracts.concat(pageList); // 配列を結合
+      page++; // 次のページへ
+      
+      // 安全策: もし1回で25件未満なら、それが最後のページなので終了
+      // (API仕様によりますが、通常満タンでなければ次はないため)
+      if (pageList.length < 5) { 
+        hasNextPage = false; 
+      }
+      // 無限ループ防止（念のため50ページで止める）
+      if (page > 50) {
+        hasNextPage = false;
+        Logger.log("⚠️ ページ数が多すぎるため50ページで中断します");
+      }
+    } else {
+      // データが取れなくなったら終了
+      hasNextPage = false;
+    }
+    
+    // APIサーバーへの負荷軽減のため少し待機
+    Utilities.sleep(500); 
   }
-  Logger.log("Step 2 OK: 取得件数 " + contractList.length + "件");
+  
+  Logger.log("データ取得完了。合計件数: " + allContracts.length + "件");
 
   // --- 書き込み処理 ---
   var newContractsCount = 0;
   var isNewDataAdded = false;
 
-  contractList.forEach(function(contract) {
-    var checkKey = String(contract.khno); // 比較用に文字列化
+  allContracts.forEach(function(contract) {
+    var checkKey = String(contract.khno); 
 
-    // 重複チェック
     if (!existingContracts.has(checkKey)) {
-      
-      // 最終行を再取得（ループ内でinsertRowするため）
       lastRow = sheet.getLastRow();
       
-      // H列以降にデータがある場合のロジック（元コード維持）
-      if (sheet.getRange(lastRow, 8).getValue() !== "") {
-        lastRow++;
+      // 空白行チェック（念のため）
+      if (sheet.getRange(lastRow, 1).getValue() !== "") {
+         // 通常はこちら
       }
-      
-      // 行を追加して書き込み
+
+      // insertRowAfter は処理が重くなることがあるため、単純追記に変更しても良いですが
+      // 元のロジック（最終行の後ろに追加）を維持します
       sheet.insertRowAfter(lastRow);
       var targetRow = lastRow + 1;
       
-      sheet.getRange(targetRow, 1).setValue(contract.jkno); // A: 契約番号
-      sheet.getRange(targetRow, 2).setValue(contract.khno); // B: YRL管理番号
-      sheet.getRange(targetRow, 3).setValue(contract.rtod); // C: レンタル終了予定日
-      sheet.getRange(targetRow, 4).setValue(contract.kmrk); // D: メーカー略称
-      sheet.getRange(targetRow, 5).setValue(contract.khnm); // E: 品名
-      sheet.getRange(targetRow, 6).setValue(contract.srno); // F: シリアル番号
-      sheet.getRange(targetRow, 7).setValue(contract.statics_name_s); // G: 分類
+      sheet.getRange(targetRow, 1).setValue(contract.jkno); 
+      sheet.getRange(targetRow, 2).setValue(contract.khno); 
+      sheet.getRange(targetRow, 3).setValue(contract.rtod); 
+      sheet.getRange(targetRow, 4).setValue(contract.kmrk); 
+      sheet.getRange(targetRow, 5).setValue(contract.khnm); 
+      sheet.getRange(targetRow, 6).setValue(contract.srno); 
+      sheet.getRange(targetRow, 7).setValue(contract.statics_name_s); 
       
-      existingContracts.add(checkKey); // 同一実行内での重複防止
+      existingContracts.add(checkKey); 
       isNewDataAdded = true;
       newContractsCount++;
       
-      Logger.log("新規追加: " + contract.khno);
+      Logger.log("新規追加: " + contract.khno + " / " + contract.rtod);
     }
   });
 
   // --- 通知 ---
   if (isNewDataAdded) {
     sendNotification(newContractsCount, SPREADSHEET_ID);
-    Logger.log("通知を送信しました。新規件数: " + newContractsCount);
+    Logger.log("通知送信完了。新規: " + newContractsCount + "件");
   } else {
-    Logger.log("新規データはありませんでした。");
+    Logger.log("新規データはありませんでした（取得済みデータのみ）");
   }
 }
 
-// ▼ 修正箇所: GETリクエストのパラメータをURL結合に変更
+// Step 1: 認証 (GET URL結合版)
 function getAPISignatureAndSID(apiKey, apiSecretKey) {
   var baseUrl = "http://wrt.simplit.jp/direct/member/generate_api_signature/";
-  // クエリパラメータとして構築
   var step1Url = baseUrl + "?api_key=" + apiKey + "&api_secret_key=" + apiSecretKey;
 
   var step1Params = {
     method: "GET",
     muteHttpExceptions: true
-    // payload は削除 (GETでは使えないため)
   };
   
   try {
     var step1Response = UrlFetchApp.fetch(step1Url, step1Params);
-    var jsonText = step1Response.getContentText();
-    var step1Data = JSON.parse(jsonText);
-    
+    var step1Data = JSON.parse(step1Response.getContentText());
     if (step1Data.status != "1") {
-      Logger.log("API Error (Step 1): Status " + step1Data.status + " / Msg: " + step1Data.message);
+      Logger.log("API Error (Step 1): " + step1Data.message);
       return { apiSignature: null, sid: null };
     }
     return { apiSignature: step1Data.api_signature, sid: step1Data.sid };
@@ -137,12 +162,12 @@ function getAPISignatureAndSID(apiKey, apiSecretKey) {
   }
 }
 
-function getContractList(apiKey, apiSignature, sid) {
+// Step 2: データ取得 (ページ番号・日数指定に対応)
+function getContractList(apiKey, apiSignature, sid, pageID, searchDaysRange) {
   var step2Url = "https://wrt.simplit.jp/management/slm/slm_contract_list_api/";
   
-  // 日付計算
   var now = new Date();
-  var date45DaysAfter = new Date(now.getTime() + 45 * 24 * 60 * 60 * 1000);
+  var dateEnd = new Date(now.getTime() + searchDaysRange * 24 * 60 * 60 * 1000);
   
   var step2Params = {
     method: "POST",
@@ -151,9 +176,9 @@ function getContractList(apiKey, apiSignature, sid) {
       "api_key": apiKey,
       "api_signature": apiSignature,
       "sid": sid,
-      "pageID": 1,
+      "pageID": pageID, // ここが動的に変わるようになりました
       "search[rtod1]": Utilities.formatDate(now, Session.getScriptTimeZone(), "yyyy-MM-dd"),
-      "search[rtod2]": Utilities.formatDate(date45DaysAfter, Session.getScriptTimeZone(), "yyyy-MM-dd")
+      "search[rtod2]": Utilities.formatDate(dateEnd, Session.getScriptTimeZone(), "yyyy-MM-dd")
     }
   };
   
@@ -162,7 +187,7 @@ function getContractList(apiKey, apiSignature, sid) {
     var step2Data = JSON.parse(step2Response.getContentText());
     
     if (step2Data.status != 1) {
-      Logger.log("API Error (Step 2): Status " + step2Data.status);
+      Logger.log("API Error (Step 2) Page " + pageID + ": " + step2Data.status);
       return null;
     }
     return step2Data.contract_list;
@@ -172,13 +197,10 @@ function getContractList(apiKey, apiSignature, sid) {
   }
 }
 
+// 通知関数
 function sendNotification(newContractsCount, spreadsheetId) {
   var webhookUrl = PropertiesService.getScriptProperties().getProperty('CHAT_WEBHOOK_URL');
-  
-  if (!webhookUrl) {
-    Logger.log("Warning: CHAT_WEBHOOK_URL が設定されていないため通知できません。");
-    return;
-  }
+  if (!webhookUrl) return;
 
   var message = {
     text: "～レンタル返却管理～\n" +
@@ -192,10 +214,5 @@ function sendNotification(newContractsCount, spreadsheetId) {
     contentType: "application/json",
     payload: JSON.stringify(message)
   };
-  
-  try {
-    UrlFetchApp.fetch(webhookUrl, options);
-  } catch(e) {
-    Logger.log("Notification Error: " + e);
-  }
+  UrlFetchApp.fetch(webhookUrl, options);
 }
