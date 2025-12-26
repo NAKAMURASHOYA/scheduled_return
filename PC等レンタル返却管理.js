@@ -7,7 +7,7 @@
 
 function fetchAndWriteContractData() {
   // ▼▼ 設定項目 ▼▼
-  var SEARCH_DAYS_RANGE = 60; // 本日から何日後まで検索するか（ここを変更してください）
+  var SEARCH_DAYS_RANGE = 45; // 本日から何日後まで検索するか（ここを変更してください）
   // ▲▲ 設定項目 ▲▲
 
   // --- プロパティの取得 ---
