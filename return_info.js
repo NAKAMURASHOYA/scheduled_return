@@ -5,19 +5,35 @@ function return_count() {
   const st = ss.getSheetByName("PC等レンタル返却管理");
 
   const today = new Date();
+  const todayYmd = Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
   const lastRow = st.getLastRow();
-  const delidayrange = st.getRange(2, 14, lastRow - 1);
+  const delidayrange = st.getRange(2, 14, Math.max(lastRow - 1, 0));
   const todayarr = delidayrange.getValues();
   const rows = [];
+  Logger.log("return_count start: rows=" + (lastRow - 1) + ", today=" + todayYmd);
 
   //返却日が今日の行番号を取得して配列に格納
   for (let i = 0; i < todayarr.length; i++) {
-
-    if (todayarr[i][0] instanceof Date && todayarr[i][0].toDateString() === today.toDateString()) {
-      rows.push(i + 2);
+    const value = todayarr[i][0];
+    if (value instanceof Date) {
+      const valueYmd = Utilities.formatDate(value, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      if (valueYmd === todayYmd) {
+        rows.push(i + 2);
+      }
+    } else if (value) {
+      try {
+        const valueDate = new Date(value);
+        const valueYmd = Utilities.formatDate(valueDate, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+        if (valueYmd === todayYmd) {
+          rows.push(i + 2);
+        }
+      } catch (e) {
+        Logger.log("Invalid date value at row " + (i + 2) + ": " + value);
+      }
     }
-
   }
+
+  Logger.log("return_count matched rows=" + rows.length + ": " + rows.join(','));
 
   //今日返却される機器がある場合処理実施
   if (rows.length !== 0) { // Changed rows !== 0 to rows.length !== 0 as rows is an array
@@ -81,9 +97,11 @@ function return_info(rows, dData) {
   const options = {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify(message)
+    payload: JSON.stringify(message),
+    muteHttpExceptions: true
   };
 
-  UrlFetchApp.fetch(webhookUrl, options);
+  const response = UrlFetchApp.fetch(webhookUrl, options);
+  Logger.log("return_info response status=" + response.getResponseCode() + ", body=" + response.getContentText());
 
 }
