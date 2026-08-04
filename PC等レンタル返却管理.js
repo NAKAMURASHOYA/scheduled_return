@@ -2,24 +2,26 @@
 // トリガー：毎朝8時～9時に実行
 // 本日の日時から45日後迄の期間データをチェック
 // 個品番号（YRL管理番号）と返却予定日を変数内に格納しスプレッドシートへ記録
-// 新規：一番下の行に追加。延長（日付変更）：既存行を上書きし、M列に「延長分」と記載。
-// 更新があった機器のYRL管理番号をGoogle Chatに一覧で通知する
+// スプレッドシート内にある「個品番号＋返却予定日」と比較して重複したデータは追加しない
+// スプレッドシートに新しいデータが追加されたらGoogle ChatへAllで通知
 
 function fetchAndWriteContractData() {
   // ▼▼ 設定項目 ▼▼
   var SEARCH_DAYS_RANGE = 45; // 本日から何日後まで検索するか
   // ▲▲ 設定項目 ▲▲
 
+  // --- プロパティの取得 ---
   var props = PropertiesService.getScriptProperties();
   var SPREADSHEET_ID = props.getProperty('SPREADSHEET_ID');
   var API_KEY = props.getProperty('API_KEY');
   var API_SECRET_KEY = props.getProperty('API_SECRET_KEY');
   
   if (!SPREADSHEET_ID || !API_KEY || !API_SECRET_KEY) {
-    Logger.log("❌ Error: スクリプトプロパティが不足しています。");
+    Logger.log("❌ Error: スクリプトプロパティ(SPREADSHEET_ID / API_KEY / API_SECRET_KEY)が不足しています。");
     return;
   }
 
+  // --- スプレッドシート準備 ---
   var spreadsheet;
   try {
     spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
@@ -35,39 +37,37 @@ function fetchAndWriteContractData() {
   }
 
   // =========================================================================
-  // 変更点A：既存データの読み込み（行番号も一緒に記憶する）
+  // 変更点①：既存データの読み込み（管理番号 ＋ 終了予定日で重複チェック）
   // =========================================================================
-  var existingData = {}; // { "YRL番号": { row: 行番号, rtod: "日付" } }
+  var existingContracts = new Set();
   var lastRow = sheet.getLastRow();
   
   if (lastRow > 1) { 
+    // B列(管理番号)からC列(終了予定日)までの2列分を取得
     var data = sheet.getRange(2, 2, lastRow - 1, 2).getValues(); 
     
-    for (var i = 0; i < data.length; i++) {
-      var rowObj = data[i];
-      if (rowObj[0] !== "" && rowObj[0] !== null) {
-        var khnoStr = String(rowObj[0]);
-        var rtodRaw = rowObj[1];
+    data.forEach(function(row) {
+      if (row[0] !== "" && row[0] !== null) {
+        var khnoStr = String(row[0]);
+        var rtodRaw = row[1];
         var rtodStr = "";
         
+        // スプレッドシートの日付を "YYYY-MM-DD" 形式の文字列に統一
         if (rtodRaw instanceof Date) {
           rtodStr = Utilities.formatDate(rtodRaw, Session.getScriptTimeZone(), "yyyy-MM-dd");
         } else {
-          rtodStr = String(rtodRaw).replace(/\//g, '-');
+          rtodStr = String(rtodRaw).replace(/\//g, '-'); // スラッシュがあればハイフンに変換
         }
         
-        // YRL番号をキーにして、そのデータが「何行目」にあるかと「日付」を保存
-        existingData[khnoStr] = {
-          row: i + 2, // 2行目から始まっているため +2
-          rtod: rtodStr
-        };
+        // 「管理番号_日付」という複合キーで保存（例: "123456_2024-05-01"）
+        existingContracts.add(khnoStr + "_" + rtodStr); 
       }
-    }
+    });
   }
 
-  appendDebugLog(spreadsheet, "run-start", "SEARCH_DAYS_RANGE=" + SEARCH_DAYS_RANGE);
+  appendDebugLog(spreadsheet, "run-start", "SEARCH_DAYS_RANGE=" + SEARCH_DAYS_RANGE + ", sheet=" + sheet.getName());
 
-  // --- Step 1: API認証 ---
+  // --- Step 1: API SignatureとSIDを取得 ---
   Logger.log("Step 1: API認証を開始します...");
   var authData = getAPISignatureAndSID(API_KEY, API_SECRET_KEY);
   if (!authData.apiSignature || !authData.sid) {
@@ -75,38 +75,52 @@ function fetchAndWriteContractData() {
     return;
   }
   
-  // --- Step 2: データ取得 ---
+  // --- Step 2: 全ページの契約データを取得 ---
   Logger.log("Step 2: 契約データを全ページ分取得します（期間: " + SEARCH_DAYS_RANGE + "日後まで）");
+  
   var allContracts = [];
   var page = 1;
   var hasNextPage = true;
 
   while (hasNextPage) {
     var pageList = getContractList(API_KEY, authData.apiSignature, authData.sid, page, SEARCH_DAYS_RANGE);
+    
     if (pageList && pageList.length > 0) {
+      Logger.log("Page " + page + ": " + pageList.length + "件取得");
       allContracts = allContracts.concat(pageList);
       page++;
-      if (pageList.length < 5) hasNextPage = false; 
-      if (page > 50) hasNextPage = false;
+      
+      if (pageList.length < 5) { 
+        hasNextPage = false; 
+      }
+      if (page > 50) {
+        hasNextPage = false;
+        Logger.log("⚠️ ページ数が多すぎるため50ページで中断します");
+      }
     } else {
       hasNextPage = false;
     }
+    
     Utilities.sleep(500); 
   }
   
-  // =========================================================================
-  // 変更点B：書き込み処理 ＆ 通知用リストの作成
-  // =========================================================================
+  Logger.log("データ取得完了。合計件数: " + allContracts.length + "件");
+
+  // --- 書き込み処理 ---
   var newContractsCount = 0;
-  var notifiedItems = []; // 通知に記載するYRL番号のリスト
+  var isNewDataAdded = false;
 
   allContracts.forEach(function(contract) {
-    var khnoStr = String(contract.khno);
+    // =========================================================================
+    // 変更点②：APIから取得したデータも「管理番号 ＋ 終了予定日」でキーを作成
+    // =========================================================================
     var apiRtodStr = String(contract.rtod).replace(/\//g, '-');
+    var checkKey = String(contract.khno) + "_" + apiRtodStr; 
 
-    if (!existingData[khnoStr]) {
-      // パターン1：完全新規（スプレッドシートに番号が存在しない）
+    // 既存リストに「管理番号_日付」が存在しない場合のみ追加
+    if (!existingContracts.has(checkKey)) {
       lastRow = sheet.getLastRow();
+      
       sheet.insertRowAfter(lastRow);
       var targetRow = lastRow + 1;
       
@@ -118,70 +132,56 @@ function fetchAndWriteContractData() {
       sheet.getRange(targetRow, 6).setValue(contract.srno); 
       sheet.getRange(targetRow, 7).setValue(contract.statics_name_s); 
       
-      // 次の重複を防ぐため記憶に追加
-      existingData[khnoStr] = { row: targetRow, rtod: apiRtodStr };
-      
+      existingContracts.add(checkKey); 
+      isNewDataAdded = true;
       newContractsCount++;
-      notifiedItems.push("・" + khnoStr + "（新規）");
-      Logger.log("新規追加: " + khnoStr);
-
-    } else if (existingData[khnoStr].rtod !== apiRtodStr) {
-      // パターン2：延長（番号は存在するが、日付が変わっている）
-      var updateRow = existingData[khnoStr].row;
       
-      // A〜G列のみ最新データで上書き（I〜K列はそのまま残る）
-      sheet.getRange(updateRow, 1).setNumberFormat("@").setValue(contract.jkno);
-      sheet.getRange(updateRow, 2).setValue(contract.khno); 
-      sheet.getRange(updateRow, 3).setValue(contract.rtod); 
-      sheet.getRange(updateRow, 4).setValue(contract.kmrk); 
-      sheet.getRange(updateRow, 5).setValue(contract.khnm); 
-      sheet.getRange(updateRow, 6).setValue(contract.srno); 
-      sheet.getRange(updateRow, 7).setValue(contract.statics_name_s); 
-      
-      // M列（13列目）に「延長分」と記載
-      sheet.getRange(updateRow, 13).setValue("延長分");
-
-      // 記憶の日付を更新
-      existingData[khnoStr].rtod = apiRtodStr;
-
-      newContractsCount++;
-      notifiedItems.push("・" + khnoStr + "（延長分）");
-      Logger.log("延長更新: " + khnoStr + " (行: " + updateRow + ")");
+      Logger.log("新規追加: " + contract.khno + " / " + contract.rtod);
     }
   });
 
   // --- 通知 ---
+  Logger.log("通知判定: 取得件数=" + allContracts.length + ", 新規追加件数=" + newContractsCount);
   appendDebugLog(spreadsheet, "run-summary", "fetched=" + allContracts.length + ", new=" + newContractsCount);
-  
-  if (newContractsCount > 0) {
-    sendNotification(newContractsCount, notifiedItems, SPREADSHEET_ID);
+  if (isNewDataAdded) {
+    sendNotification(newContractsCount, SPREADSHEET_ID);
   } else {
-    Logger.log("ℹ️ 新規・延長データはありませんでした（通知スキップ）");
+    Logger.log("ℹ️ 新規データはありませんでした（通知はスキップされました）");
   }
 }
 
 function appendDebugLog(spreadsheet, label, detail) {
   try {
     var debugSheet = spreadsheet.getSheetByName("debug_log");
-    if (!debugSheet) debugSheet = spreadsheet.insertSheet("debug_log");
+    if (!debugSheet) {
+      debugSheet = spreadsheet.insertSheet("debug_log");
+    }
     debugSheet.appendRow([new Date(), label, String(detail)]);
   } catch (e) {
     Logger.log("Debug log write failed: " + e);
   }
 }
 
-// Step 1: 認証
+// Step 1: 認証 (GET URL結合版)
 function getAPISignatureAndSID(apiKey, apiSecretKey) {
   var baseUrl = "https://wrt.simplit.jp/direct/member/generate_api_signature/";
   var step1Url = baseUrl + "?api_key=" + encodeURIComponent(apiKey) + "&api_secret_key=" + encodeURIComponent(apiSecretKey);
-  var step1Params = { method: "GET", muteHttpExceptions: true };
+
+  var step1Params = {
+    method: "GET",
+    muteHttpExceptions: true
+  };
   
   try {
     var step1Response = UrlFetchApp.fetch(step1Url, step1Params);
     var step1Data = JSON.parse(step1Response.getContentText());
-    if (step1Data.status != "1") return { apiSignature: null, sid: null };
+    if (step1Data.status != "1") {
+      Logger.log("API Error (Step 1): " + step1Data.message);
+      return { apiSignature: null, sid: null };
+    }
     return { apiSignature: step1Data.api_signature, sid: step1Data.sid };
   } catch (e) {
+    Logger.log("Exception (Step 1): " + e);
     return { apiSignature: null, sid: null };
   }
 }
@@ -189,6 +189,7 @@ function getAPISignatureAndSID(apiKey, apiSecretKey) {
 // Step 2: データ取得
 function getContractList(apiKey, apiSignature, sid, pageID, searchDaysRange) {
   var step2Url = "https://wrt.simplit.jp/management/slm/slm_contract_list_api/";
+  
   var now = new Date();
   var dateEnd = new Date(now.getTime() + searchDaysRange * 24 * 60 * 60 * 1000);
   
@@ -208,29 +209,37 @@ function getContractList(apiKey, apiSignature, sid, pageID, searchDaysRange) {
   try {
     var step2Response = UrlFetchApp.fetch(step2Url, step2Params);
     var step2Data = JSON.parse(step2Response.getContentText());
-    if (step2Data.status != 1) return null;
-    return step2Data.contract_list || step2Data.contractList || step2Data.list || (step2Data.data ? step2Data.data.contract_list : null);
+    var responseStatus = step2Data.status;
+    var contractList = step2Data.contract_list || step2Data.contractList || step2Data.list || (step2Data.data ? step2Data.data.contract_list : null);
+
+    Logger.log("Step 2 response status: " + responseStatus + ", keys=" + (step2Data ? Object.keys(step2Data).join(",") : "none"));
+    if (responseStatus != 1) {
+      Logger.log("API Error (Step 2) Page " + pageID + ": " + responseStatus + " / " + JSON.stringify(step2Data));
+      return null;
+    }
+    if (!contractList) {
+      Logger.log("Step 2 returned no contract list. Raw response: " + JSON.stringify(step2Data));
+      return [];
+    }
+    return contractList;
   } catch (e) {
+    Logger.log("Exception (Step 2): " + e);
     return null;
   }
 }
 
-// =========================================================================
-// 変更点C：通知関数（YRL番号のリストを受け取り、本文に挿入する）
-// =========================================================================
-function sendNotification(newContractsCount, notifiedItems, spreadsheetId) {
+// 通知関数（ログ出力・エラーチェックの強化版）
+function sendNotification(newContractsCount, spreadsheetId) {
   var webhookUrl = PropertiesService.getScriptProperties().getProperty('CHAT_WEBHOOK_URL');
-  if (!webhookUrl) return;
-
-  // 配列を改行区切りのテキストに変換
-  var itemsText = notifiedItems.join("\n");
+  if (!webhookUrl) {
+    Logger.log("❌ Error: CHAT_WEBHOOK_URL がスクリプトプロパティに設定されていません。");
+    return;
+  }
 
   var message = {
     text: "～レンタル返却管理～\n" +
           "<users/all>\n" +
-          "新たに返却予定の情報が " + newContractsCount + " 件追加（更新）されました！\n\n" +
-          "【対象YRL管理番号】\n" +
-          itemsText + "\n\n" +
+          "新たに返却予定の情報が " + newContractsCount + " 件追加されました！\n\n" +
           "https://docs.google.com/spreadsheets/d/" + spreadsheetId + "/edit#gid=1906719251"
   };
 
@@ -241,5 +250,24 @@ function sendNotification(newContractsCount, notifiedItems, spreadsheetId) {
     muteHttpExceptions: true
   };
 
-  UrlFetchApp.fetch(webhookUrl, options);
+  try {
+    var response = UrlFetchApp.fetch(webhookUrl, options);
+    var code = response.getResponseCode();
+    var body = response.getContentText();
+    if (code === 200) {
+      Logger.log("✅ Google Chat通知送信成功: " + newContractsCount + "件");
+    } else {
+      Logger.log("❌ Google Chat通知失敗 (HTTP " + code + "): " + body);
+    }
+  } catch(e) {
+    Logger.log("❌ Google Chat通信エラー: " + e.toString());
+  }
+}
+
+// 【テスト用関数】通知単体テスト
+function testGoogleChatNotification() {
+  var props = PropertiesService.getScriptProperties();
+  var SPREADSHEET_ID = props.getProperty('SPREADSHEET_ID');
+  Logger.log("--- Google Chat 通知テスト開始 ---");
+  sendNotification(99, SPREADSHEET_ID);
 }
